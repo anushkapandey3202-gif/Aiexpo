@@ -1,0 +1,235 @@
+---
+# ============================================================================
+# SentinelAI - Audio Ingestion Service: Kubernetes Deployment
+# ============================================================================
+# Design notes:
+#   - replicas: 3 for HA across 3 AZs (pair with a PodDisruptionBudget minAvailable=2)
+#   - workers=1 ENFORCED: ConnectionManager & AudioBufferManager hold in-memory state
+#   - Horizontal scaling = more pods, not more workers per pod
+#   - WebSocket connections are session-affinity routed via NLB cookie or client IP hash
+#   - Resource limits tuned for: 10,000 concurrent WS connections, 200ms chunk latency
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelai-audio-ingestion
+  namespace: sentinelai
+  labels:
+    app: sentinelai-audio-ingestion
+    component: ingestion
+    version: "1.0.0"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sentinelai-audio-ingestion
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # Zero-downtime deploy
+  template:
+    metadata:
+      labels:
+        app: sentinelai-audio-ingestion
+        component: ingestion
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: sentinelai-audio-ingestion
+              topologyKey: topology.kubernetes.io/zone   # Spread across AZs
+      terminationGracePeriodSeconds: 60  # Allow in-flight streams to complete
+
+      containers:
+        - name: ingestion
+          image: 123456789.dkr.ecr.us-east-1.amazonaws.com/sentinelai/audio-ingestion:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8001
+              name: http-ws
+              protocol: TCP
+          command:
+            - uvicorn
+            - sentinel_ai.services.ingestion.main:create_app
+            - --factory
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8001"
+            - --workers
+            - "1"            # CRITICAL: must be 1 — in-memory state is not shared
+            - --loop
+            - uvloop
+            - --http
+            - httptools
+            - --timeout-keep-alive
+            - "120"          # Hold idle HTTP connections for 2 min (WS upgrade window)
+          env:
+            - name: ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: sentinelai-config
+                  key: ENVIRONMENT
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-db-secret
+                  key: host
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-db-secret
+                  key: database
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-db-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-db-secret
+                  key: password
+            - name: REDIS_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-redis-secret
+                  key: host
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-redis-secret
+                  key: password
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-kafka-secret
+                  key: bootstrap_servers
+            - name: KAFKA_SASL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-kafka-secret
+                  key: sasl_username
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-kafka-secret
+                  key: sasl_password
+            - name: AES_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelai-encryption-secret
+                  key: aes_master_key
+          volumeMounts:
+            - name: jwt-public-key
+              mountPath: /run/secrets
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"     # Base + in-memory audio buffers (Tier 1)
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"     # Upper bound for burst-period buffers
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8001
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Give uvicorn 45s to drain WebSocket connections before SIGTERM
+                command: ["/bin/sleep", "45"]
+
+      volumes:
+        - name: jwt-public-key
+          secret:
+            secretName: sentinelai-jwt-keys
+            items:
+              - key: public_key_pem
+                path: jwt_public.pem
+
+      serviceAccountName: sentinelai-ingestion-sa
+
+---
+# Service — NLB with session affinity for sticky WebSocket routing
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinelai-audio-ingestion
+  namespace: sentinelai
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: sentinelai-audio-ingestion
+  sessionAffinity: ClientIP            # Sticky routing for WebSocket sessions
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 600              # 10-min session affinity window
+  ports:
+    - name: wss
+      port: 443
+      targetPort: 8001
+      protocol: TCP
+
+---
+# HPA — scale on CPU; max capped at 10 pods (K8s WebSocket affinity breaks above ~10)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sentinelai-audio-ingestion-hpa
+  namespace: sentinelai
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sentinelai-audio-ingestion
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+---
+# PodDisruptionBudget — maintain ≥ 2 replicas during node drains / rolling deploys
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinelai-audio-ingestion-pdb
+  namespace: sentinelai
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: sentinelai-audio-ingestion
