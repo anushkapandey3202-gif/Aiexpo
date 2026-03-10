@@ -1,0 +1,252 @@
+# =============================================================================
+# SentinelAI — Docker Compose (Local Development)
+# Mirrors production topology: API + ML + Router + Kafka + Redis + Postgres
+# Usage: docker compose up --build
+# =============================================================================
+
+version: "3.9"
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
+networks:
+  sentinel-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
+  zookeeper-data:
+  model-cache:
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    <<: *default-restart
+    environment:
+      POSTGRES_DB: sentinelai
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - sentinel-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinelai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    <<: *default-restart
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-devredis}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - sentinel-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-devredis}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+
+  # ── Kafka + KRaft (no Zookeeper) ────────────────────────────────────────────
+  kafka:
+    image: bitnami/kafka:3.6.1
+    <<: *default-restart
+    environment:
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_NUM_PARTITIONS: "4"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes:
+      - kafka-data:/bitnami/kafka
+    ports:
+      - "9094:9094"    # External access from host
+    networks:
+      - sentinel-net
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    logging: *default-logging
+
+  # ── Kafka UI (dev only) ─────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    <<: *default-restart
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: sentinelai-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8080:8080"
+    networks:
+      - sentinel-net
+    logging: *default-logging
+
+  # ── FastAPI Backend ─────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.api
+      target: production
+    <<: *default-restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      PORT: "8000"
+      WORKERS: "2"
+      LOG_LEVEL: DEBUG
+      DATABASE_URL: postgresql+asyncpg://sentinel:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/sentinelai
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-devredis}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ML_INFERENCE_URL: http://ml:8001
+      JWT_ALGORITHM: RS256
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY}
+      AES_MASTER_KEY: ${AES_MASTER_KEY}
+      PINECONE_API_KEY: ${PINECONE_API_KEY:-}
+      PINECONE_ENVIRONMENT: ${PINECONE_ENVIRONMENT:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./services/api:/app:ro    # Live-reload for development
+    networks:
+      - sentinel-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+
+  # ── ML Inference (CPU mode for local dev) ───────────────────────────────────
+  ml:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.ml
+      target: production
+    <<: *default-restart
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      PORT: "8001"
+      LOG_LEVEL: DEBUG
+      TRANSFORMERS_CACHE: /opt/sentinelai/models
+      WHISPER_MODEL_SIZE: tiny.en   # Small model for local dev
+      CUDA_VISIBLE_DEVICES: ""      # Force CPU mode locally
+      PINECONE_API_KEY: ${PINECONE_API_KEY:-}
+      PINECONE_ENVIRONMENT: ${PINECONE_ENVIRONMENT:-}
+    ports:
+      - "8001:8001"
+    volumes:
+      - model-cache:/opt/sentinelai/models
+      - ./services/ml_inference:/app:ro
+    networks:
+      - sentinel-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health/live"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+    logging: *default-logging
+
+  # ── Go Stream Router ─────────────────────────────────────────────────────────
+  router:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.router
+      target: production
+    <<: *default-restart
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      PORT: "9090"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_CONSUMER_GROUP: sentinel-router
+      ROUTER_WORKERS: "4"
+    ports:
+      - "9090:9090"
+    networks:
+      - sentinel-net
+    logging: *default-logging
+
+  # ── Prometheus (dev metrics) ─────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    <<: *default-restart
+    volumes:
+      - ./scripts/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+    networks:
+      - sentinel-net
+    logging: *default-logging
+
+  # ── Grafana (dev dashboards) ─────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.3
+    <<: *default-restart
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    networks:
+      - sentinel-net
+    logging: *default-logging

@@ -1,0 +1,177 @@
+# =============================================================================
+# SentinelAI — Kubernetes Namespace, RBAC & Network Policy
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinelai
+  labels:
+    app.kubernetes.io/part-of: sentinelai
+    environment: production
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+---
+# Service Account — API Gateway
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelai-api
+  namespace: sentinelai
+  labels:
+    app.kubernetes.io/component: api
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/SentinelAI-API-Role
+
+---
+# Service Account — ML Inference
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelai-ml
+  namespace: sentinelai
+  labels:
+    app.kubernetes.io/component: ml-inference
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/SentinelAI-ML-Role
+
+---
+# Service Account — Stream Router
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelai-router
+  namespace: sentinelai
+  labels:
+    app.kubernetes.io/component: stream-router
+
+---
+# Role — minimal permissions per service
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinelai-pod-reader
+  namespace: sentinelai
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinelai-api-binding
+  namespace: sentinelai
+subjects:
+  - kind: ServiceAccount
+    name: sentinelai-api
+    namespace: sentinelai
+  - kind: ServiceAccount
+    name: sentinelai-ml
+    namespace: sentinelai
+  - kind: ServiceAccount
+    name: sentinelai-router
+    namespace: sentinelai
+roleRef:
+  kind: Role
+  apiRef: sentinelai-pod-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Network Policy — default deny all ingress/egress, then selectively open
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: sentinelai
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# Network Policy — API Gateway: allow external ingress on 8000, egress to ml/redis/postgres
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-gateway
+  namespace: sentinelai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ml-inference
+      ports:
+        - protocol: TCP
+          port: 8001
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+    # Allow DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow external HTTPS (Pinecone, AWS APIs)
+    - ports:
+        - protocol: TCP
+          port: 443
+
+---
+# Network Policy — ML: ingress only from API
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ml-inference
+  namespace: sentinelai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: ml-inference
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+      ports:
+        - protocol: TCP
+          port: 8001
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: 443

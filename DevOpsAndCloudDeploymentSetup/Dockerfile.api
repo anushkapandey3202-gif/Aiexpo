@@ -1,0 +1,100 @@
+# =============================================================================
+# SentinelAI — FastAPI Backend Service
+# Multi-stage build for minimal, secure production image
+# =============================================================================
+
+# ── Stage 1: Dependency builder ───────────────────────────────────────────────
+FROM python:3.11-slim-bookworm AS builder
+
+# Security: run as non-root during build
+RUN groupadd --gid 1001 sentinel && \
+    useradd --uid 1001 --gid sentinel --shell /bin/bash --create-home sentinel
+
+WORKDIR /build
+
+# Install system build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    libssl-dev \
+    libffi-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip and install wheel
+RUN pip install --upgrade pip wheel setuptools
+
+# Copy and install Python dependencies (layer-cached)
+COPY requirements/api.txt ./requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ── Stage 2: Production runtime ───────────────────────────────────────────────
+FROM python:3.11-slim-bookworm AS production
+
+LABEL maintainer="sentinelai-platform@yourorg.com" \
+      service="sentinelai-api" \
+      version="1.0.0"
+
+# Install runtime-only system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    libssl3 \
+    curl \
+    tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create non-root user
+RUN groupadd --gid 1001 sentinel && \
+    useradd --uid 1001 --gid sentinel --shell /bin/bash --create-home sentinel
+
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
+
+WORKDIR /app
+
+# Copy application source
+COPY --chown=sentinel:sentinel ./services/api ./
+
+# Set secure file permissions
+RUN chmod -R 550 /app && \
+    find /app -name "*.py" -exec chmod 440 {} \;
+
+# Create writable directories for runtime artifacts
+RUN mkdir -p /app/tmp /app/logs && \
+    chown -R sentinel:sentinel /app/tmp /app/logs && \
+    chmod 750 /app/tmp /app/logs
+
+# Switch to non-root
+USER sentinel
+
+# Environment defaults (overridden by K8s ConfigMap/Secrets)
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    APP_ENV=production \
+    PORT=8000 \
+    WORKERS=4 \
+    MAX_CONNECTIONS=1000 \
+    KEEPALIVE=75
+
+EXPOSE 8000
+
+# Health check — hits the /health liveness endpoint
+HEALTHCHECK --interval=20s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8000/health/live || exit 1
+
+# Use tini as PID 1 for proper signal handling
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+CMD ["sh", "-c", \
+     "uvicorn main:app \
+      --host 0.0.0.0 \
+      --port $PORT \
+      --workers $WORKERS \
+      --loop uvloop \
+      --http httptools \
+      --timeout-keep-alive $KEEPALIVE \
+      --access-log \
+      --log-level info \
+      --no-server-header"]

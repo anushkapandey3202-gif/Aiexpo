@@ -1,0 +1,253 @@
+# =============================================================================
+# SentinelAI — StorageClass, Ingress (ALB), ServiceMonitor (Prometheus)
+# =============================================================================
+
+# ── Encrypted gp3 StorageClass for EKS ───────────────────────────────────────
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-encrypted
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+  encrypted: "true"
+  kmsKeyId: "arn:aws:kms:REGION:ACCOUNT_ID:key/KMS_KEY_ID"
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain              # Never auto-delete production volumes
+allowVolumeExpansion: true
+
+---
+# ── AWS ALB Ingress — HTTPS Termination + WAF ─────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sentinelai-ingress
+  namespace: sentinelai
+  labels:
+    app.kubernetes.io/part-of: sentinelai
+  annotations:
+    # AWS Load Balancer Controller annotations
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/load-balancer-name: sentinelai-prod
+    # HTTPS
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:REGION:ACCOUNT_ID:certificate/CERT_ID"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # WAF
+    alb.ingress.kubernetes.io/wafv2-acl-arn: "arn:aws:wafv2:REGION:ACCOUNT_ID:regional/webacl/sentinelai/ACL_ID"
+    # Health check
+    alb.ingress.kubernetes.io/healthcheck-path: /health/live
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    # Connection settings
+    alb.ingress.kubernetes.io/load-balancer-attributes: |
+      idle_timeout.timeout_seconds=120,
+      routing.http2.enabled=true,
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=sentinelai-alb-logs,
+      access_logs.s3.prefix=prod
+    # Security headers (via ALB response headers)
+    alb.ingress.kubernetes.io/response-headers: |
+      Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+      X-Content-Type-Options: nosniff
+      X-Frame-Options: DENY
+      X-XSS-Protection: 1; mode=block
+      Referrer-Policy: strict-origin-when-cross-origin
+      Content-Security-Policy: default-src 'self'
+    # Multi-AZ target groups
+    alb.ingress.kubernetes.io/subnets: "subnet-PUBLIC-AZ1,subnet-PUBLIC-AZ2,subnet-PUBLIC-AZ3"
+    alb.ingress.kubernetes.io/security-groups: "sg-SENTINELAI-ALB"
+spec:
+  ingressClassName: alb
+  rules:
+    - host: api.sentinelai.yourorg.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sentinelai-api
+                port:
+                  number: 8000
+    - host: stream.sentinelai.yourorg.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sentinelai-router
+                port:
+                  number: 9090
+
+---
+# ── Prometheus ServiceMonitor ─────────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sentinelai-api-monitor
+  namespace: sentinelai
+  labels:
+    release: prometheus-stack         # Must match Prometheus operator selector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelai-api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      scheme: http
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sentinelai-ml-monitor
+  namespace: sentinelai
+  labels:
+    release: prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelai-ml
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 15s
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sentinelai-router-monitor
+  namespace: sentinelai
+  labels:
+    release: prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelai-router
+  endpoints:
+    - port: grpc-ws
+      path: /metrics
+      interval: 15s
+
+---
+# ── PrometheusRule — SentinelAI alerting rules ────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sentinelai-alerts
+  namespace: sentinelai
+  labels:
+    release: prometheus-stack
+spec:
+  groups:
+    - name: sentinelai.api
+      interval: 30s
+      rules:
+        - alert: APIHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{job="sentinelai-api", status=~"5.."}[5m]))
+            / sum(rate(http_requests_total{job="sentinelai-api"}[5m])) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "API error rate exceeds 5%"
+            description: "{{ $value | humanizePercentage }} of requests are failing"
+
+        - alert: APIHighLatencyP99
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{job="sentinelai-api"}[5m]))
+              by (le)) > 2.0
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "API P99 latency > 2s"
+
+        - alert: APIPodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{
+              namespace="sentinelai",
+              pod=~"sentinelai-api-.*"
+            }[15m]) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "API pod crash-looping detected"
+
+    - name: sentinelai.ml
+      interval: 60s
+      rules:
+        - alert: MLInferenceBacklogCritical
+          expr: |
+            sum(kafka_consumer_group_lag{
+              namespace="sentinelai",
+              consumergroup=~"sentinel-ml-.*"
+            }) > 500
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "ML Kafka backlog exceeds 500 messages"
+
+        - alert: MLInferenceHighLatency
+          expr: |
+            histogram_quantile(0.95,
+              rate(ml_inference_duration_seconds_bucket{job="sentinelai-ml"}[5m])
+              ) > 5.0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "ML inference P95 latency > 5s"
+
+        - alert: GPUUtilizationLow
+          expr: |
+            avg(DCGM_FI_DEV_GPU_UTIL{namespace="sentinelai"}) < 20
+          for: 15m
+          labels:
+            severity: info
+          annotations:
+            summary: "GPU utilisation below 20% — over-provisioned"
+
+    - name: sentinelai.security
+      interval: 60s
+      rules:
+        - alert: HighDeepfakeDetectionRate
+          expr: |
+            sum(rate(deepfake_detections_total{namespace="sentinelai"}[5m])) > 10
+          for: 1m
+          labels:
+            severity: critical
+            escalate: soc
+          annotations:
+            summary: "Spike in deepfake detections — possible coordinated attack"
+
+        - alert: JWTAuthFailureSpike
+          expr: |
+            sum(rate(auth_failures_total{namespace="sentinelai", reason="invalid_jwt"}[5m])) > 50
+          for: 2m
+          labels:
+            severity: warning
+            escalate: soc
+          annotations:
+            summary: "JWT auth failure rate spiking — possible brute-force"

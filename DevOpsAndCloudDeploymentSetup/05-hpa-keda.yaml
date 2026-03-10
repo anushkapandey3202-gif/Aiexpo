@@ -1,0 +1,217 @@
+# =============================================================================
+# SentinelAI — Horizontal Pod Autoscaling
+# API & Router: CPU/memory-based HPA
+# ML Inference: KEDA ScaledObject driven by Kafka consumer lag
+# =============================================================================
+
+# ── API Gateway HPA ────────────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sentinelai-api-hpa
+  namespace: sentinelai
+  labels:
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sentinelai-api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65       # Scale out before saturation
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "500"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 5-min cooldown before scale-in
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+      selectPolicy: Min
+
+---
+# ── Stream Router HPA ─────────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sentinelai-router-hpa
+  namespace: sentinelai
+  labels:
+    app.kubernetes.io/component: stream-router
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sentinelai-router
+  minReplicas: 3
+  maxReplicas: 15
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Pods
+      pods:
+        metric:
+          name: websocket_active_connections
+        target:
+          type: AverageValue
+          averageValue: "3000"         # Scale at 3k WS connections per pod
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 180
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+
+---
+# ── ML Inference — KEDA ScaledObject (Kafka lag-driven) ──────────────────────
+# Requires KEDA v2.x installed in the cluster
+# Scale ML pods based on unprocessed Kafka message backlog
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: sentinelai-ml-scaledobject
+  namespace: sentinelai
+  labels:
+    app.kubernetes.io/component: ml-inference
+spec:
+  scaleTargetRef:
+    name: sentinelai-ml
+  pollingInterval: 15           # Check Kafka lag every 15 seconds
+  cooldownPeriod: 120           # Wait 2 minutes before scaling down
+  minReplicaCount: 2
+  maxReplicaCount: 10
+  fallback:
+    failureThreshold: 3
+    replicas: 3                 # Fallback replica count if scaler fails
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 180
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+  triggers:
+    # Scale on audio analysis backlog
+    - type: kafka
+      metadata:
+        bootstrapServers: "kafka-headless.sentinelai.svc.cluster.local:9092"
+        consumerGroup: "sentinel-ml-audio"
+        topic: "sentinel.audio.raw"
+        lagThreshold: "50"             # 1 pod per 50 unprocessed messages
+        offsetResetPolicy: latest
+    # Scale on video analysis backlog
+    - type: kafka
+      metadata:
+        bootstrapServers: "kafka-headless.sentinelai.svc.cluster.local:9092"
+        consumerGroup: "sentinel-ml-video"
+        topic: "sentinel.video.raw"
+        lagThreshold: "20"             # Video is heavier — lower threshold
+        offsetResetPolicy: latest
+    # Scale on NLP text analysis backlog
+    - type: kafka
+      metadata:
+        bootstrapServers: "kafka-headless.sentinelai.svc.cluster.local:9092"
+        consumerGroup: "sentinel-ml-text"
+        topic: "sentinel.text.raw"
+        lagThreshold: "100"
+        offsetResetPolicy: latest
+
+---
+# ── Vertical Pod Autoscaler — ML (recommendation mode only) ──────────────────
+# Observe and recommend right-sized resource requests without auto-apply
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: sentinelai-ml-vpa
+  namespace: sentinelai
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sentinelai-ml
+  updatePolicy:
+    updateMode: "Off"            # Recommendation only; apply manually
+  resourcePolicy:
+    containerPolicies:
+      - containerName: ml-inference
+        minAllowed:
+          cpu: "1000m"
+          memory: "4Gi"
+        maxAllowed:
+          cpu: "8000m"
+          memory: "32Gi"
+        controlledResources: ["cpu", "memory"]
+
+---
+# ── Cluster Autoscaler annotation for EKS node groups ────────────────────────
+# Applied to the aws-auth ConfigMap and node group via eksctl/Terraform
+# This ConfigMap documents the annotations to set on ASG
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-autoscaler-config
+  namespace: sentinelai
+data:
+  api-nodegroup: |
+    k8s.io/cluster-autoscaler/enabled: "true"
+    k8s.io/cluster-autoscaler/sentinelai: "owned"
+    k8s.io/cluster-autoscaler/node-template/label/node-role: api-workload
+    k8s.io/cluster-autoscaler/node-template/resources/ephemeral-storage: 50Gi
+
+  gpu-nodegroup: |
+    k8s.io/cluster-autoscaler/enabled: "true"
+    k8s.io/cluster-autoscaler/sentinelai: "owned"
+    k8s.io/cluster-autoscaler/node-template/label/node-role: gpu-workload
+    k8s.io/cluster-autoscaler/node-template/label/nvidia.com/gpu.present: "true"
+    k8s.io/cluster-autoscaler/node-template/resources/nvidia.com/gpu: "1"
+    k8s.io/cluster-autoscaler/scale-down-delay-after-add: 15m
+    k8s.io/cluster-autoscaler/scale-down-unneeded-time: 10m

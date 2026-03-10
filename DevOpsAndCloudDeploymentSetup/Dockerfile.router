@@ -1,0 +1,49 @@
+# =============================================================================
+# SentinelAI — Go High-Throughput Stream Router
+# Handles Kafka ingestion, real-time routing, WebSocket fan-out
+# =============================================================================
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM golang:1.22-bookworm AS builder
+
+WORKDIR /build
+
+# Cache module downloads separately
+COPY services/stream_router/go.mod services/stream_router/go.sum ./
+RUN go mod download && go mod verify
+
+COPY services/stream_router/ ./
+
+# Compile with security hardening flags
+RUN CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64 \
+    go build \
+    -trimpath \
+    -ldflags="-s -w -extldflags=-static" \
+    -o /stream-router \
+    ./cmd/router
+
+# ── Stage 2: Distroless runtime ───────────────────────────────────────────────
+FROM gcr.io/distroless/static-debian12:nonroot AS production
+
+LABEL maintainer="sentinelai-platform@yourorg.com" \
+      service="sentinelai-stream-router" \
+      version="1.0.0"
+
+COPY --from=builder /stream-router /stream-router
+
+EXPOSE 9090
+
+ENV APP_ENV=production \
+    PORT=9090 \
+    KAFKA_CONSUMER_GROUP=sentinel-router \
+    KAFKA_MAX_BYTES=10485760 \
+    ROUTER_WORKERS=8
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["/stream-router", "--health-check"]
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/stream-router"]
