@@ -1,0 +1,338 @@
+# =============================================================================
+# SentinelAI ML Service — Kubernetes Manifests
+# Namespace: sentinel-prod
+# Components: Deployment, Service, HPA, ConfigMap, PodDisruptionBudget
+# =============================================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinel-prod
+  labels:
+    app.kubernetes.io/managed-by: helm
+    sentinel.ai/tier: ml
+
+---
+# ── ConfigMap: Non-sensitive environment configuration ────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-ml-config
+  namespace: sentinel-prod
+  labels:
+    app: sentinel-ml-service
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  API_PORT: "8001"
+  KAFKA_AUDIO_TOPIC: "raw_audio_events"
+  KAFKA_THREAT_TOPIC: "threat_scores"
+  KAFKA_CONSUMER_GROUP: "ml-inference-group"
+  KAFKA_MAX_POLL_RECORDS: "10"
+  PINECONE_INDEX_NAME: "sentinel-voiceprints"
+  PINECONE_NAMESPACE: "voiceprint-v1"
+  DEVICE_PREFERENCE: "auto"
+  MAX_CONCURRENT_INFERENCES: "8"
+  AUDIO_SAMPLE_RATE: "16000"
+  DEEPFAKE_THRESHOLD_WARN: "0.55"
+  DEEPFAKE_THRESHOLD_ALERT: "0.80"
+  MODEL_CACHE_DIR: "/models/cache"
+  ECAPA_TDNN_MODEL_PATH: "/models/ecapa_tdnn/ecapa_tdnn_v1.pt"
+  RAWNET3_MODEL_PATH: "/models/rawnet3/rawnet3_v1.pt"
+  PROMETHEUS_PORT: "9090"
+
+---
+# ── Deployment ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-ml-service
+  namespace: sentinel-prod
+  labels:
+    app: sentinel-ml-service
+    version: "1.0.0"
+    app.kubernetes.io/component: ml-inference
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sentinel-ml-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0      # Zero-downtime: never remove a pod before new one is Ready
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: sentinel-ml-service
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: sentinel-ml-sa
+      terminationGracePeriodSeconds: 60  # Allow in-flight inference to complete
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ── Init Container: Sync model artifacts from S3 ───────────────────────
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.18.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              aws s3 sync s3://${S3_MODEL_BUCKET}/models/ /models/ \
+                --exclude "*.tmp" \
+                --no-progress \
+                && echo "Model sync complete"
+          envFrom:
+            - configMapRef:
+                name: sentinel-ml-config
+          env:
+            - name: S3_MODEL_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-ml-secrets
+                  key: S3_MODEL_BUCKET
+            - name: AWS_REGION
+              value: "us-east-1"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+
+      containers:
+        - name: sentinel-ml-service
+          image: 123456789.dkr.ecr.us-east-1.amazonaws.com/sentinel-ml-service:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8001
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: sentinel-ml-config
+          env:
+            # Secrets injected from Kubernetes Secret (sealed with SealedSecrets/ESO)
+            - name: PINECONE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-ml-secrets
+                  key: PINECONE_API_KEY
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-ml-secrets
+                  key: KAFKA_BOOTSTRAP_SERVERS
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-ml-secrets
+                  key: REDIS_URL
+            - name: KAFKA_SASL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-ml-secrets
+                  key: KAFKA_SASL_USERNAME
+                  optional: true
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-ml-secrets
+                  key: KAFKA_SASL_PASSWORD
+                  optional: true
+
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+              readOnly: true
+            - name: jwt-public-key
+              mountPath: /run/secrets
+              readOnly: true
+
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+              # Uncomment for GPU nodes (requires nvidia device plugin):
+              # nvidia.com/gpu: "1"
+            limits:
+              memory: "8Gi"
+              cpu: "4"
+              # nvidia.com/gpu: "1"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 60    # Models need time to load
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30       # Allow 5 mins for cold start (model download)
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: sentinel-model-pvc
+        - name: jwt-public-key
+          secret:
+            secretName: sentinel-jwt-public-key
+            defaultMode: 0440
+
+      # GPU node affinity (uncomment for GPU workloads)
+      # affinity:
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #         - matchExpressions:
+      #             - key: node.kubernetes.io/instance-type
+      #               operator: In
+      #               values: ["g4dn.xlarge", "g4dn.2xlarge", "p3.2xlarge"]
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: sentinel-ml-service
+
+---
+# ── Service ───────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-ml-service
+  namespace: sentinel-prod
+  labels:
+    app: sentinel-ml-service
+spec:
+  type: ClusterIP
+  selector:
+    app: sentinel-ml-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8001
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+
+---
+# ── Horizontal Pod Autoscaler ─────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sentinel-ml-hpa
+  namespace: sentinel-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sentinel-ml-service
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Slow scale-down to avoid thrashing
+
+---
+# ── PodDisruptionBudget ───────────────────────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-ml-pdb
+  namespace: sentinel-prod
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sentinel-ml-service
+
+---
+# ── PersistentVolumeClaim for model artifacts ─────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sentinel-model-pvc
+  namespace: sentinel-prod
+spec:
+  accessModes:
+    - ReadOnlyMany   # Multiple pods can read simultaneously
+  storageClassName: efs-sc  # AWS EFS CSI driver
+  resources:
+    requests:
+      storage: 20Gi
