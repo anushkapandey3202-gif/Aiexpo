@@ -1,0 +1,295 @@
+# =============================================================================
+# SentinelAI NLP Service — Kubernetes Manifests
+# Higher memory limits than ML service (Whisper + DeBERTa loaded together).
+# =============================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-nlp-config
+  namespace: sentinel-prod
+  labels:
+    app: sentinel-nlp-service
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  API_PORT: "8002"
+  KAFKA_AUDIO_TOPIC: "raw_audio_events"
+  KAFKA_THREAT_TOPIC: "threat_scores"
+  KAFKA_NLP_ENRICHMENT_TOPIC: "nlp_enrichments"
+  KAFKA_CONSUMER_GROUP: "nlp-inference-group"
+  KAFKA_MAX_POLL_RECORDS: "5"
+  WHISPER_MODEL_SIZE: "small"
+  WHISPER_COMPUTE_TYPE: "int8_float16"
+  WHISPER_DEVICE: "auto"
+  WHISPER_VAD_FILTER: "true"
+  WHISPER_WORD_TIMESTAMPS: "true"
+  INTENT_MODEL_NAME: "microsoft/deberta-v3-base"
+  INTENT_MAX_SEQ_LENGTH: "256"
+  INTENT_CONFIDENCE_THRESHOLD: "0.60"
+  MAX_CONCURRENT_TRANSCRIPTIONS: "4"
+  MAX_CONCURRENT_INTENT_INFERENCES: "8"
+  PIPELINE_TIMEOUT_SECONDS: "30.0"
+  HF_HUB_OFFLINE: "true"
+  NLP_THREAT_SCORE_WARN: "0.55"
+  NLP_THREAT_SCORE_ALERT: "0.75"
+  NLP_THREAT_SCORE_CRITICAL: "0.90"
+  PROMETHEUS_PORT: "9091"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-nlp-service
+  namespace: sentinel-prod
+  labels:
+    app: sentinel-nlp-service
+    version: "1.0.0"
+    app.kubernetes.io/component: nlp-inference
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sentinel-nlp-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: sentinel-nlp-service
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: sentinel-nlp-sa
+      terminationGracePeriodSeconds: 90    # Transcription jobs can take up to 30s
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        - name: model-sync
+          image: amazon/aws-cli:2.18.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Sync Whisper model
+              aws s3 sync s3://${S3_MODEL_BUCKET}/models/whisper/ /models/whisper/ --no-progress
+              # Sync intent classifier checkpoint
+              aws s3 sync s3://${S3_MODEL_BUCKET}/models/intent_classifier/ /models/intent_classifier/ --no-progress
+              echo "NLP model sync complete"
+          env:
+            - name: S3_MODEL_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-nlp-secrets
+                  key: S3_MODEL_BUCKET
+            - name: AWS_REGION
+              value: "us-east-1"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+
+      containers:
+        - name: sentinel-nlp-service
+          image: 123456789.dkr.ecr.us-east-1.amazonaws.com/sentinel-nlp-service:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8002
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: sentinel-nlp-config
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-nlp-secrets
+                  key: KAFKA_BOOTSTRAP_SERVERS
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-nlp-secrets
+                  key: REDIS_URL
+            - name: PINECONE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-nlp-secrets
+                  key: PINECONE_API_KEY
+
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+              readOnly: true
+            - name: jwt-public-key
+              mountPath: /run/secrets
+              readOnly: true
+
+          resources:
+            requests:
+              memory: "6Gi"    # Whisper small (~500MB) + DeBERTa-v3 (~700MB) + overhead
+              cpu: "2"
+              # nvidia.com/gpu: "1"   # Uncomment for GPU nodes
+            limits:
+              memory: "12Gi"
+              cpu: "4"
+              # nvidia.com/gpu: "1"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 90    # Whisper + DeBERTa take longer to load
+            periodSeconds: 20
+            timeoutSeconds: 15
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 40       # Allow 10 mins for S3 model download + load
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: sentinel-nlp-model-pvc
+        - name: jwt-public-key
+          secret:
+            secretName: sentinel-jwt-public-key
+            defaultMode: 0440
+
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: sentinel-nlp-service
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-nlp-service
+  namespace: sentinel-prod
+  labels:
+    app: sentinel-nlp-service
+spec:
+  type: ClusterIP
+  selector:
+    app: sentinel-nlp-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8002
+    - name: metrics
+      port: 9091
+      targetPort: 9091
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sentinel-nlp-hpa
+  namespace: sentinel-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sentinel-nlp-service
+  minReplicas: 2
+  maxReplicas: 6   # Fewer replicas than ML svc; heavier per-pod footprint
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 90
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 90
+    scaleDown:
+      stabilizationWindowSeconds: 600
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-nlp-pdb
+  namespace: sentinel-prod
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sentinel-nlp-service
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sentinel-nlp-model-pvc
+  namespace: sentinel-prod
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 30Gi    # Whisper models range 150MB–3GB; DeBERTa ~700MB
